@@ -5,8 +5,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.util.List;
-import java.util.Scanner;
+import java.util.*;
 import org.json.JSONObject;
 
 /**
@@ -32,8 +31,11 @@ public class NfcAgent {
 
     // Polling-Intervall (ms) für den NFC-Leser
     private static final long POLL_INTERVAL_MS = 1000;
-    // Flag, um zu verhindern, dass dieselbe Karte mehrfach verarbeitet wird, solange sie im Leser liegt.
-    private static boolean cardProcessed = false;
+    // Sperrzeit (pro Benutzer) – z.B. 60 Sekunden
+    private static final long STAMP_LOCK_MS = 60000;
+
+    // Statt eines globalen Flags und Zeitstempels: Mapping von Benutzername -> letzter Stempelzeitpunkt (in Millisekunden)
+    private static Map<String, Long> userLastStampMap = new HashMap<>();
 
     public static void main(String[] args) {
         if (args.length > 0 && args[0].equalsIgnoreCase("program")) {
@@ -57,19 +59,21 @@ public class NfcAgent {
                 }
                 CardTerminal terminal = terminals.get(0);
                 if (terminal.isCardPresent()) {
-                    if (!cardProcessed) {
-                        System.out.println("Karte erkannt. Starte Stempelvorgang ...");
-                        // Lese Block 1 – hier werden die auf der Karte gespeicherten Daten erwartet
-                        String cardHexData = readBlock(1);
-                        String username = hexToAscii(cardHexData).trim();
-                        System.out.println("Aus Karte gelesener Username: '" + username + "'");
-                        if (username.isEmpty()) {
-                            System.out.println("Kein Benutzername in der Karte gefunden. Vorgang überspringen.");
+                    // Lese Daten von der Karte
+                    String cardHexData = readBlock(1);
+                    String username = hexToAscii(cardHexData).trim();
+                    if (username.isEmpty()) {
+                        System.out.println("Kein Benutzername in der Karte gefunden. Vorgang überspringen.");
+                    } else {
+                        long now = System.currentTimeMillis();
+                        // Hole den letzten Stempelzeitpunkt für diesen Benutzer (falls vorhanden)
+                        Long lastStamp = userLastStampMap.get(username);
+                        if (lastStamp != null && (now - lastStamp) < STAMP_LOCK_MS) {
+                            System.out.println("Benutzer '" + username + "' hat innerhalb der Sperrzeit bereits gestempelt. Vorgang überspringen.");
                         } else {
-                            // Sende Punch-Request an API
+                            System.out.println("Benutzer '" + username + "' wird gestempelt.");
                             String punchResponse = sendPunch(username);
                             System.out.println("Punch API Antwort: " + punchResponse);
-                            // Bestimme neuen Status anhand der API-Antwort:
                             String newStatus;
                             if (punchResponse.contains("Work Start")) {
                                 newStatus = "I";  // hereinkommen
@@ -78,22 +82,19 @@ public class NfcAgent {
                             } else {
                                 newStatus = "X";  // unbekannter Status
                             }
-                            // Formatiere neue Kartendaten: "username Status" (16 Zeichen, rechts aufgefüllt oder abgeschnitten)
                             String newCardDataAscii = formatCardData(username, newStatus);
                             String newCardDataHex = asciiToHex(newCardDataAscii);
                             System.out.println("Neue Kartendaten: " + newCardDataAscii + " (Hex: " + newCardDataHex + ")");
                             String writeResult = writeSector0Block1(newCardDataHex);
                             System.out.println("Ergebnis des Schreibvorgangs: " + writeResult);
+                            // Aktualisiere die letzte Stempelzeit für diesen Benutzer
+                            userLastStampMap.put(username, now);
                         }
-                        cardProcessed = true;
-                    } else {
-                        System.out.println("Karte wurde bereits verarbeitet. Warte auf Entfernung.");
                     }
                 } else {
-                    if (cardProcessed) {
-                        System.out.println("Karte entfernt. Bereit für neuen Vorgang.");
-                        cardProcessed = false;
-                    }
+                    // Optional: Entferne Benutzer aus der Map, wenn die Karte entfernt wird
+                    // (Das ist optional – eventuell möchtest Du den Sperrzeitraum auch über das Entfernen hinaus gelten lassen)
+                    System.out.println("Keine Karte vorhanden.");
                     Thread.sleep(POLL_INTERVAL_MS);
                 }
             } catch (CardException ce) {
@@ -113,6 +114,7 @@ public class NfcAgent {
 
     /* ---------------- Program Mode ---------------- */
     private static void runProgramMode(String[] args) {
+        // (Program Mode bleibt unverändert – hier geht es nur um das Stempeln.)
         String dataToWrite = (args.length > 1) ? args[1] : "";
         if (dataToWrite.isEmpty()) {
             System.out.println("Kein Programmdaten-Text über Parameter. Bitte eingeben:");
@@ -120,7 +122,7 @@ public class NfcAgent {
             dataToWrite = scanner.nextLine();
         }
         System.out.println("Program Mode: Zu schreibende Daten: '" + dataToWrite + "'");
-        String formattedData = formatCardData(dataToWrite, ""); // Keine Status-Angabe im Program Mode
+        String formattedData = formatCardData(dataToWrite, "");
         String hexData = asciiToHex(formattedData);
         System.out.println("Konvertierte Daten (Hex): " + hexData);
 
@@ -201,7 +203,7 @@ public class NfcAgent {
         }
     }
 
-    /* ---------------- NFC-Lese- und Schreibmethoden (basierend auf NfcService.java) ---------------- */
+    /* ---------------- NFC-Lese- und Schreibmethoden ---------------- */
     private static String readBlock(int blockNumber) throws Exception {
         TerminalFactory factory = TerminalFactory.getDefault();
         List<CardTerminal> terminals = factory.terminals().list();
@@ -219,7 +221,6 @@ public class NfcAgent {
         }
 
         CardChannel channel = card.getBasicChannel();
-        // Versuche, den Schlüssel zu laden (hier zwei Standard-Schlüssel)
         String[] possibleKeys = { "FFFFFFFFFFFF", "A0A1A2A3A4A5" };
         boolean authSuccess = false;
         Exception authException = null;
@@ -234,7 +235,6 @@ public class NfcAgent {
                 if (loadKeyResponse.getSW() != 0x9000) {
                     continue;
                 }
-                // Authentifizierung (verwende Key A: 0x60)
                 byte[] authCommand = new byte[] {
                         (byte)0xFF, (byte)0x86, 0x00, 0x00, 0x05,
                         0x01, 0x00, (byte) blockNumber, 0x60, 0x00
@@ -258,7 +258,6 @@ public class NfcAgent {
                 throw new Exception("Keine der Authentifizierungen war erfolgreich!");
             }
         }
-        // Lese Befehl für den angegebenen Block:
         byte[] readCommand = new byte[] {
                 (byte)0xFF, (byte)0xB0, 0x00, (byte) blockNumber, 0x10
         };
@@ -282,17 +281,14 @@ public class NfcAgent {
             throw new Exception("Kein NFC-Leser gefunden");
         }
         CardTerminal terminal = terminals.get(0);
-        // Versuch mit Key A ("A0A1A2A3A4A5")
         String keyA = "A0A1A2A3A4A5";
         try {
-            String result = writeBlockWithKey(terminal, blockNumber, hexData, keyA, 0x60);
-            return result;
+            return writeBlockWithKey(terminal, blockNumber, hexData, keyA, 0x60);
         } catch (Exception e) {
-            // Falls nicht, versuche mit Key B ("FFFFFFFFFFFF")
+            // Falls nicht, versuche mit Key B
         }
         String keyB = "FFFFFFFFFFFF";
-        String result = writeBlockWithKey(terminal, blockNumber, hexData, keyB, 0x61);
-        return result;
+        return writeBlockWithKey(terminal, blockNumber, hexData, keyB, 0x61);
     }
 
     private static String writeBlockWithKey(CardTerminal terminal, int blockNumber, String hexData, String keyString, int keyCode) throws Exception {
@@ -353,7 +349,8 @@ public class NfcAgent {
         int len = s.length();
         byte[] data = new byte[len / 2];
         for (int i = 0; i < len; i += 2) {
-            data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4) + Character.digit(s.charAt(i+1), 16));
+            data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
+                    + Character.digit(s.charAt(i+1), 16));
         }
         return data;
     }
