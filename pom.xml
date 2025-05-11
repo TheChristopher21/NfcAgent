@@ -19,6 +19,11 @@
             <artifactId>json</artifactId>
             <version>20231013</version>
         </dependency>
+        <dependency>
+            <groupId>javazoom</groupId>
+            <artifactId>jlayer</artifactId>
+            <version>1.0.1</version>
+        </dependency>
 
         <!-- Für PC/SC,
              in neueren Java-Versionen kann javax.smartcardio bereits

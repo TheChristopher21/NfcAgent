@@ -1,56 +1,68 @@
 package com.chrono;
 
 import javax.smartcardio.*;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.io.*;
+import java.net.*;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Scanner;
 import org.json.JSONObject;
+import javazoom.jl.player.Player;  // JLayer zum Abspielen von MP3-Dateien
 
 /**
- * ExternalNfcAgent – eigenständiger NFC Agent zum Auslesen, Beschreiben und Übermitteln der Kartendaten.
+ * ExternalNfcAgent – Ein NFC-Agent, der im Stamp Mode (Stempeln) und im Program Mode (Programmieren) arbeitet.
  *
- * Es gibt zwei Modi:
+ * Der Agent läuft standardmäßig im Stamp Mode und wechselt nur dann in den Programmiermodus,
+ * wenn über das Frontend ein neuer Programmierbefehl (Typ "PROGRAM") ausgelöst wurde.
  *
- * 1) Stamp Mode (Standard):
- *    - Überwacht kontinuierlich den NFC-Leser.
- *    - Liest in Block 1 den gespeicherten Benutzernamen (als Hex-String, in ASCII umgerechnet).
- *    - Sendet per HTTP an das TimeTracking-API einen Punch-Request, der den Ein-/Ausstempelvorgang auslöst.
- *    - Bestimmt anhand der Antwort den neuen Status ("I" für hereinkommen, "O" für rausgehen) und schreibt
- *      diese Information (zusammen mit dem Benutzernamen, auf 16 Zeichen formatiert) zurück in Block 1.
+ * Nach einem erfolgreichen Stempel- oder Programmiervorgang wird ein Sound abgespielt.
  *
- * 2) Program Mode:
- *    - Wird mit dem Parameter "program" gestartet.
- *    - Dann wird auf eine Karteinlage gewartet und der angegebene Text (oder per Konsole eingegebene) auf die Karte geschrieben.
+ * Der Agent-Token wird als System-Property gelesen (über JVM-Option -Dnfc.agent.token).
  */
 public class NfcAgent {
 
-    // API-Endpunkt zum Stempeln (Punch-Request)
+    private static final String AGENT_TOKEN = System.getProperty("nfc.agent.token", "SUPER-SECRET-AGENT-TOKEN");
+    private static final String NFC_COMMAND_ENDPOINT = "https://api.chrono-logisch.ch/api/nfc/command";
     private static final String TIME_PUNCH_ENDPOINT = "https://api.chrono-logisch.ch/api/timetracking/punch";
-
-    // Polling-Intervall (ms) für den NFC-Leser
     private static final long POLL_INTERVAL_MS = 1000;
-    // Sperrzeit (pro Benutzer) – z.B. 60 Sekunden
-    private static final long STAMP_LOCK_MS = 60000;
+    private static boolean cardProcessed = false;
+    private static final long STAMP_COOLDOWN_MS = 30000;
+    private static final long PROGRAM_LOCK_MS = 10000;
+    private static Map<String, Long> lastStampLockUntil = new HashMap<>();
+    private static Map<String, Long> lastStampTimes = new HashMap<>();
 
-    // Statt eines globalen Flags und Zeitstempels: Mapping von Benutzername -> letzter Stempelzeitpunkt (in Millisekunden)
-    private static Map<String, Long> userLastStampMap = new HashMap<>();
+    private static boolean programCommandActive = false;
+    private static String pendingProgramData = "";
+    private static long pendingCommandId = -1;
+    private static long lastProcessedCommandId = -1;
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
+        System.out.println("AGENT_TOKEN = " + AGENT_TOKEN);
         if (args.length > 0 && args[0].equalsIgnoreCase("program")) {
-            runProgramMode(args);
+            runProgramModeForCommand((args.length > 1) ? args[1] : "", -1);
         } else {
             runStampMode();
         }
     }
 
-    /* ---------------- Stamp Mode (Standard) ---------------- */
-    private static void runStampMode() {
+    private static void runStampMode() throws InterruptedException {
         System.out.println("Starte NFC Stamp Mode ...");
-
         while (true) {
             try {
+                if (!programCommandActive) {
+                    JSONObject command = fetchPendingCommand();
+                    if (command != null && "PROGRAM".equalsIgnoreCase(command.optString("type"))) {
+                        long commandId = command.optLong("id", -1);
+                        if (commandId != lastProcessedCommandId) {
+                            pendingProgramData = command.optString("data", "");
+                            pendingCommandId = commandId;
+                            programCommandActive = true;
+                            System.out.println("Neuer Programmierbefehl empfangen: Daten = '" + pendingProgramData + "', ID = " + pendingCommandId);
+                        }
+                    }
+                }
                 List<CardTerminal> terminals = TerminalFactory.getDefault().terminals().list();
                 if (terminals.isEmpty()) {
                     System.out.println("Kein NFC-Leser gefunden. Warte 3 Sekunden...");
@@ -58,77 +70,108 @@ public class NfcAgent {
                     continue;
                 }
                 CardTerminal terminal = terminals.get(0);
+                if (programCommandActive) {
+                    if (terminal.isCardPresent()) {
+                        System.out.println("Bitte entfernen Sie die Karte, um in den Programmiermodus zu wechseln.");
+                        Thread.sleep(POLL_INTERVAL_MS);
+                        continue;
+                    }
+                    System.out.println("Warte auf Karteinlage im Programmiermodus...");
+                    runProgramModeForCommand(pendingProgramData, pendingCommandId);
+                    lastProcessedCommandId = pendingCommandId;
+                    // Setze Sperrphase für den programmierten Benutzer
+                    String userForLock = pendingProgramData.trim();
+                    lastStampLockUntil.put(userForLock, System.currentTimeMillis() + PROGRAM_LOCK_MS);
+                    programCommandActive = false;
+                    pendingProgramData = "";
+                    pendingCommandId = -1;
+                    continue;
+                }
                 if (terminal.isCardPresent()) {
-                    // Lese Daten von der Karte
-                    String cardHexData = readBlock(1);
-                    String username = hexToAscii(cardHexData).trim();
-                    if (username.isEmpty()) {
-                        System.out.println("Kein Benutzername in der Karte gefunden. Vorgang überspringen.");
-                    } else {
-                        long now = System.currentTimeMillis();
-                        // Hole den letzten Stempelzeitpunkt für diesen Benutzer (falls vorhanden)
-                        Long lastStamp = userLastStampMap.get(username);
-                        if (lastStamp != null && (now - lastStamp) < STAMP_LOCK_MS) {
-                            System.out.println("Benutzer '" + username + "' hat innerhalb der Sperrzeit bereits gestempelt. Vorgang überspringen.");
-                        } else {
-                            System.out.println("Benutzer '" + username + "' wird gestempelt.");
+                    if (!cardProcessed) {
+                        System.out.println("Karte erkannt. Starte Stempelvorgang ...");
+                        String cardHexData = readBlock(1);
+                        String cardData = hexToAscii(cardHexData).trim();
+                        String username = cardData.split(" ")[0];
+                        System.out.println("Aus Karte gelesener Username: '" + username + "'");
+                        if (!username.isEmpty()) {
+                            long currentTime = System.currentTimeMillis();
+                            if (lastStampLockUntil.containsKey(username)) {
+                                long lockUntil = lastStampLockUntil.get(username);
+                                if (currentTime < lockUntil) {
+                                    long remainingSec = (lockUntil - currentTime) / 1000;
+                                    System.out.println("Stempeln von '" + username + "' ist gesperrt. Bitte warten Sie " + remainingSec + " Sekunden.");
+                                    Thread.sleep(POLL_INTERVAL_MS);
+                                    continue;
+                                }
+                            }
+                            if (lastStampTimes.containsKey(username)) {
+                                long lastTime = lastStampTimes.get(username);
+                                if (currentTime - lastTime < STAMP_COOLDOWN_MS) {
+                                    long remainingSec = (STAMP_COOLDOWN_MS - (currentTime - lastTime)) / 1000;
+                                    System.out.println("Stempeln von '" + username + "' ist noch gesperrt. Bitte warten Sie " + remainingSec + " Sekunden.");
+                                    Thread.sleep(POLL_INTERVAL_MS);
+                                    continue;
+                                }
+                            }
+                            lastStampTimes.put(username, currentTime);
                             String punchResponse = sendPunch(username);
                             System.out.println("Punch API Antwort: " + punchResponse);
-                            String newStatus;
-                            if (punchResponse.contains("Work Start")) {
-                                newStatus = "I";  // hereinkommen
-                            } else if (punchResponse.contains("Work End")) {
-                                newStatus = "O";  // rausgehen
-                            } else {
-                                newStatus = "X";  // unbekannter Status
-                            }
+                            String newStatus = punchResponse.contains("Work Start") ? "I" : punchResponse.contains("Work End") ? "O" : "X";
                             String newCardDataAscii = formatCardData(username, newStatus);
                             String newCardDataHex = asciiToHex(newCardDataAscii);
                             System.out.println("Neue Kartendaten: " + newCardDataAscii + " (Hex: " + newCardDataHex + ")");
                             String writeResult = writeSector0Block1(newCardDataHex);
                             System.out.println("Ergebnis des Schreibvorgangs: " + writeResult);
-                            // Aktualisiere die letzte Stempelzeit für diesen Benutzer
-                            userLastStampMap.put(username, now);
+                            // Setze den Cooldown für den Stempelvorgang
+                            lastStampLockUntil.put(username, System.currentTimeMillis() + STAMP_COOLDOWN_MS);
+                            playSound();
+                        } else {
+                            System.out.println("Kein Benutzername in der Karte gefunden. Vorgang überspringen.");
                         }
+                        cardProcessed = true;
+                    } else {
+                        System.out.println("Karte wurde bereits verarbeitet. Warte auf Entfernung.");
                     }
                 } else {
-                    // Optional: Entferne Benutzer aus der Map, wenn die Karte entfernt wird
-                    // (Das ist optional – eventuell möchtest Du den Sperrzeitraum auch über das Entfernen hinaus gelten lassen)
-                    System.out.println("Keine Karte vorhanden.");
+                    if (cardProcessed) {
+                        System.out.println("Karte entfernt. Bereit für neuen Vorgang.");
+                        cardProcessed = false;
+                    }
                     Thread.sleep(POLL_INTERVAL_MS);
                 }
             } catch (CardException ce) {
                 System.err.println("Fehler beim NFC-Leser: " + ce.getMessage());
                 ce.printStackTrace();
-                try { Thread.sleep(3000); } catch (InterruptedException ie) {}
+                Thread.sleep(3000);
             } catch (InterruptedException ie) {
                 System.err.println("Agent unterbrochen. Beende...");
                 break;
             } catch (Exception e) {
                 System.err.println("Fehler im Stamp Mode: " + e.getMessage());
                 e.printStackTrace();
-                try { Thread.sleep(3000); } catch (InterruptedException ie) {}
+                Thread.sleep(3000);
             }
         }
     }
 
-    /* ---------------- Program Mode ---------------- */
-    private static void runProgramMode(String[] args) {
-        // (Program Mode bleibt unverändert – hier geht es nur um das Stempeln.)
-        String dataToWrite = (args.length > 1) ? args[1] : "";
-        if (dataToWrite.isEmpty()) {
-            System.out.println("Kein Programmdaten-Text über Parameter. Bitte eingeben:");
-            Scanner scanner = new Scanner(System.in);
-            dataToWrite = scanner.nextLine();
-        }
+    private static void runProgramModeForCommand(String dataToWrite, long commandId) throws InterruptedException {
         System.out.println("Program Mode: Zu schreibende Daten: '" + dataToWrite + "'");
         String formattedData = formatCardData(dataToWrite, "");
         String hexData = asciiToHex(formattedData);
         System.out.println("Konvertierte Daten (Hex): " + hexData);
 
         boolean cardProgrammed = false;
+        long startTime = System.currentTimeMillis();
         while (!cardProgrammed) {
             try {
+                if (System.currentTimeMillis() - startTime > 10000) {
+                    System.out.println("Timeout: Keine Karte innerhalb von 10 Sekunden erkannt. Markiere Befehl als done und beende den Programmiermodus.");
+                    if (commandId != -1) {
+                        updateCommandStatus(commandId, "done");
+                    }
+                    break;
+                }
                 List<CardTerminal> terminals = TerminalFactory.getDefault().terminals().list();
                 if (terminals.isEmpty()) {
                     System.out.println("Kein NFC-Leser gefunden. Warte 3 Sekunden...");
@@ -141,35 +184,59 @@ public class NfcAgent {
                     String writeResult = writeSector0Block1(hexData);
                     System.out.println("Ergebnis des Schreibvorgangs: " + writeResult);
                     cardProgrammed = true;
+                    if (commandId != -1) {
+                        updateCommandStatus(commandId, "done");
+                    }
+                    playSound();
                 } else {
-                    System.out.println("Warte auf Karteinlage...");
+                    System.out.println("Warte auf Karteinlage im Program Mode...");
                     Thread.sleep(POLL_INTERVAL_MS);
                 }
             } catch (CardException ce) {
-                System.err.println("Fehler beim NFC-Leser: " + ce.getMessage());
+                System.err.println("Fehler beim NFC-Leser (Program Mode): " + ce.getMessage());
                 ce.printStackTrace();
-                try { Thread.sleep(3000); } catch (InterruptedException ie) {}
+                Thread.sleep(3000);
             } catch (InterruptedException ie) {
-                System.err.println("Agent unterbrochen. Beende...");
+                System.err.println("Agent unterbrochen im Program Mode. Beende...");
                 break;
             } catch (Exception e) {
                 System.err.println("Fehler im Program Mode: " + e.getMessage());
                 e.printStackTrace();
-                try { Thread.sleep(3000); } catch (InterruptedException ie) {}
+                Thread.sleep(3000);
             }
         }
+        System.out.println("Program Mode abgeschlossen. Wechsel zurück in den Stamp Mode.");
     }
 
-    /* ---------------- HTTP Kommunikation für Stempeln ---------------- */
+    // Spielt den Sound aus der eingebetteten Ressource ab.
+    private static void playSound() {
+        new Thread(() -> {
+            try (BufferedInputStream buffer = new BufferedInputStream(
+                    NfcAgent.class.getResourceAsStream("/com/chrono/sounds/stamp.mp3"))) {
+                if (buffer == null) {
+                    System.err.println("Sound-Datei '/com/chrono/sounds/stamp.mp3' nicht gefunden!");
+                    return;
+                }
+                Player player = new Player(buffer);
+                player.play();
+            } catch (Exception e) {
+                System.err.println("Fehler beim Abspielen des Sounds: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
     private static String sendPunch(String username) {
         try {
-            URL url = new URL(TIME_PUNCH_ENDPOINT + "?username=" + username);
+            username = username.trim();
+            String encodedUsername = URLEncoder.encode(username, StandardCharsets.UTF_8.name());
+            URL url = new URL(TIME_PUNCH_ENDPOINT + "?username=" + encodedUsername);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-            conn.setDoOutput(true);
+            conn.setDoOutput(false);
             int responseCode = conn.getResponseCode();
             System.out.println("Punch API Response Code: " + responseCode);
             return getResponseString(conn);
@@ -177,6 +244,56 @@ public class NfcAgent {
             System.err.println("Fehler beim Punch-Request: " + e.getMessage());
             e.printStackTrace();
             return "";
+        }
+    }
+
+    private static JSONObject fetchPendingCommand() {
+        try {
+            URL url = new URL(NFC_COMMAND_ENDPOINT);
+            HttpURLConnection con = (HttpURLConnection) url.openConnection();
+            con.setRequestMethod("GET");
+            con.setConnectTimeout(3000); // max 3 Sekunden warten
+            con.setReadTimeout(3000);
+
+            int status = con.getResponseCode();
+            if (status == 200) {
+                BufferedReader in = new BufferedReader(new InputStreamReader(con.getInputStream()));
+                String inputLine;
+                StringBuilder content = new StringBuilder();
+                while ((inputLine = in.readLine()) != null) {
+                    content.append(inputLine);
+                }
+                in.close();
+                con.disconnect();
+                return new JSONObject(content.toString());
+            } else {
+                con.disconnect();
+                return null;
+            }
+        } catch (ConnectException | SocketTimeoutException ce) {
+            System.out.println("⚠️ Backend nicht erreichbar. Versuche erneut...");
+        } catch (Exception e) {
+            System.out.println("❌ Allgemeiner Fehler bei der Verbindung: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private static void updateCommandStatus(long id, String status) {
+        try {
+            URL url = new URL(NFC_COMMAND_ENDPOINT + "/" + id + "?status=" + status);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("PUT");
+            System.out.println("Sende X-Agent-Token: " + AGENT_TOKEN);
+            conn.setRequestProperty("X-Agent-Token", AGENT_TOKEN);
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            int responseCode = conn.getResponseCode();
+            System.out.println("Update Command Response Code: " + responseCode);
+            String response = getResponseString(conn);
+            System.out.println("Update Command Response: " + response);
+        } catch (Exception e) {
+            System.err.println("Fehler beim Aktualisieren des Befehls: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -203,12 +320,12 @@ public class NfcAgent {
         }
     }
 
-    /* ---------------- NFC-Lese- und Schreibmethoden ---------------- */
     private static String readBlock(int blockNumber) throws Exception {
         TerminalFactory factory = TerminalFactory.getDefault();
         List<CardTerminal> terminals = factory.terminals().list();
         if (terminals.isEmpty()) {
-            throw new Exception("Kein NFC-Leser gefunden");
+            System.out.println("Kein NFC-Leser gefunden. Verwende Simulationswert.");
+            return "0102030405060708090A0B0C0D0E0F10";
         }
         CardTerminal terminal = terminals.get(0);
         Card card;
@@ -219,7 +336,6 @@ public class NfcAgent {
         } catch (Exception e) {
             throw new Exception("Verbindungsfehler mit dem NFC-Reader: " + e.getMessage());
         }
-
         CardChannel channel = card.getBasicChannel();
         String[] possibleKeys = { "FFFFFFFFFFFF", "A0A1A2A3A4A5" };
         boolean authSuccess = false;
@@ -283,9 +399,10 @@ public class NfcAgent {
         CardTerminal terminal = terminals.get(0);
         String keyA = "A0A1A2A3A4A5";
         try {
-            return writeBlockWithKey(terminal, blockNumber, hexData, keyA, 0x60);
+            String result = writeBlockWithKey(terminal, blockNumber, hexData, keyA, 0x60);
+            return result;
         } catch (Exception e) {
-            // Falls nicht, versuche mit Key B
+            // Falls Key A nicht funktioniert, versuche Key B
         }
         String keyB = "FFFFFFFFFFFF";
         return writeBlockWithKey(terminal, blockNumber, hexData, keyB, 0x61);
@@ -355,10 +472,6 @@ public class NfcAgent {
         return data;
     }
 
-    /* ---------------- Hilfsfunktionen ---------------- */
-    /**
-     * Konvertiert einen Hex-String in einen ASCII-String.
-     */
     private static String hexToAscii(String hex) {
         StringBuilder output = new StringBuilder();
         for (int i = 0; i < hex.length(); i += 2) {
@@ -368,9 +481,6 @@ public class NfcAgent {
         return output.toString();
     }
 
-    /**
-     * Konvertiert einen ASCII-String in einen Hex-String.
-     */
     private static String asciiToHex(String s) {
         StringBuilder sb = new StringBuilder();
         for (byte b : s.getBytes(StandardCharsets.US_ASCII)) {
@@ -379,10 +489,6 @@ public class NfcAgent {
         return sb.toString();
     }
 
-    /**
-     * Formatiert einen gegebenen Text (und optional einen Status) zu einem 16-Zeichen langen ASCII-String.
-     * Falls der kombinierte String kürzer ist, wird er rechts aufgefüllt, andernfalls abgeschnitten.
-     */
     private static String formatCardData(String data, String status) {
         String combined = data + (status.isEmpty() ? "" : " " + status);
         if (combined.length() < 16) {
