@@ -28,7 +28,7 @@ public class NfcAgent {
     private static final String TIME_PUNCH_ENDPOINT = "https://api.chrono-logisch.ch/api/timetracking/punch";
     private static final long POLL_INTERVAL_MS = 1000;
     private static boolean cardProcessed = false;
-    private static final long STAMP_COOLDOWN_MS = 30000;
+    private static final long STAMP_COOLDOWN_MS = 60000;
     private static final long PROGRAM_LOCK_MS = 10000;
     private static Map<String, Long> lastStampLockUntil = new HashMap<>();
     private static Map<String, Long> lastStampTimes = new HashMap<>();
