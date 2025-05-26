@@ -236,7 +236,10 @@ public class NfcAgent {
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-            conn.setDoOutput(false);
+            conn.setRequestProperty("X-NFC-Agent-Request", "true"); // <-- **DIESE ZEILE MUSS HINZUGEFÜGT WERDEN**
+            conn.setDoOutput(false); // Für POST ohne Body, aber da wir Query-Parameter verwenden, ist das ok.
+            // Wenn Sie einen Body senden würden, wäre es true.
+
             int responseCode = conn.getResponseCode();
             System.out.println("Punch API Response Code: " + responseCode);
             return getResponseString(conn);
