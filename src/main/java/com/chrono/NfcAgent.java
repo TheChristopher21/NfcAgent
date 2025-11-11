@@ -79,8 +79,7 @@ public class NfcAgent {
                     System.out.println("Warte auf Karteinlage im Programmiermodus...");
                     runProgramModeForCommand(pendingProgramData, pendingCommandId);
                     lastProcessedCommandId = pendingCommandId;
-                    // Setze Sperrphase für den programmierten Benutzer
-                    String userForLock = pendingProgramData.trim();
+                    String userForLock = extractUsername(pendingProgramData);
                     lastStampLockUntil.put(userForLock, System.currentTimeMillis() + PROGRAM_LOCK_MS);
                     programCommandActive = false;
                     pendingProgramData = "";
@@ -92,7 +91,8 @@ public class NfcAgent {
                         System.out.println("Karte erkannt. Starte Stempelvorgang ...");
                         String cardHexData = readBlock(1);
                         String cardData = hexToAscii(cardHexData).trim();
-                        String username = cardData.split(" ")[0];
+                        String[] cardInfo = parseCardData(cardData);
+                        String username = cardInfo[0];
                         System.out.println("Aus Karte gelesener Username: '" + username + "'");
                         if (!username.isEmpty()) {
                             long currentTime = System.currentTimeMillis();
@@ -123,7 +123,6 @@ public class NfcAgent {
                             System.out.println("Neue Kartendaten: " + newCardDataAscii + " (Hex: " + newCardDataHex + ")");
                             String writeResult = writeSector0Block1(newCardDataHex);
                             System.out.println("Ergebnis des Schreibvorgangs: " + writeResult);
-                            // Setze den Cooldown für den Stempelvorgang
                             lastStampLockUntil.put(username, System.currentTimeMillis() + STAMP_COOLDOWN_MS);
                             playSound();
                         } else {
@@ -157,7 +156,7 @@ public class NfcAgent {
 
     private static void runProgramModeForCommand(String dataToWrite, long commandId) throws InterruptedException {
         System.out.println("Program Mode: Zu schreibende Daten: '" + dataToWrite + "'");
-        String formattedData = formatCardData(dataToWrite, "");
+        String formattedData = formatCardData(extractUsername(dataToWrite), "");
         String hexData = asciiToHex(formattedData);
         System.out.println("Konvertierte Daten (Hex): " + hexData);
 
@@ -208,7 +207,6 @@ public class NfcAgent {
         System.out.println("Program Mode abgeschlossen. Wechsel zurück in den Stamp Mode.");
     }
 
-    // Spielt den Sound aus der eingebetteten Ressource ab.
     private static void playSound() {
         new Thread(() -> {
             try (BufferedInputStream buffer = new BufferedInputStream(
@@ -236,9 +234,8 @@ public class NfcAgent {
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-            conn.setRequestProperty("X-NFC-Agent-Request", "true"); // <-- **DIESE ZEILE MUSS HINZUGEFÜGT WERDEN**
-            conn.setDoOutput(false); // Für POST ohne Body, aber da wir Query-Parameter verwenden, ist das ok.
-            // Wenn Sie einen Body senden würden, wäre es true.
+            conn.setRequestProperty("X-NFC-Agent-Request", "true");
+            conn.setDoOutput(false);
 
             int responseCode = conn.getResponseCode();
             System.out.println("Punch API Response Code: " + responseCode);
@@ -255,7 +252,7 @@ public class NfcAgent {
             URL url = new URL(NFC_COMMAND_ENDPOINT);
             HttpURLConnection con = (HttpURLConnection) url.openConnection();
             con.setRequestMethod("GET");
-            con.setConnectTimeout(3000); // max 3 Sekunden warten
+            con.setConnectTimeout(3000);
             con.setReadTimeout(3000);
 
             int status = con.getResponseCode();
@@ -405,7 +402,6 @@ public class NfcAgent {
             String result = writeBlockWithKey(terminal, blockNumber, hexData, keyA, 0x60);
             return result;
         } catch (Exception e) {
-            // Falls Key A nicht funktioniert, versuche Key B
         }
         String keyB = "FFFFFFFFFFFF";
         return writeBlockWithKey(terminal, blockNumber, hexData, keyB, 0x61);
@@ -493,7 +489,8 @@ public class NfcAgent {
     }
 
     private static String formatCardData(String data, String status) {
-        String combined = data + (status.isEmpty() ? "" : " " + status);
+        String username = extractUsername(data);
+        String combined = status.isEmpty() ? username : username + "|" + status;
         if (combined.length() < 16) {
             combined = String.format("%-16s", combined);
         } else if (combined.length() > 16) {
@@ -501,4 +498,43 @@ public class NfcAgent {
         }
         return combined;
     }
+
+    private static String extractUsername(String data) {
+        if (data == null) {
+            return "";
+        }
+        String trimmed = data.trim();
+        if (trimmed.contains("|")) {
+            return trimmed.split("\\|", 2)[0].trim();
+        }
+        if (trimmed.contains(" ")) {
+            return trimmed.split(" ", 2)[0].trim();
+        }
+        return trimmed;
+    }
+
+    private static String[] parseCardData(String cardData) {
+        String username = "";
+        String status = "";
+        if (cardData != null) {
+            String trimmed = cardData.trim();
+            if (trimmed.contains("|")) {
+                String[] parts = trimmed.split("\\|", 2);
+                username = parts[0].trim();
+                if (parts.length > 1) {
+                    status = parts[1].trim();
+                }
+            } else if (trimmed.contains(" ")) {
+                String[] parts = trimmed.split(" ", 2);
+                username = parts[0].trim();
+                if (parts.length > 1) {
+                    status = parts[1].trim();
+                }
+            } else {
+                username = trimmed;
+            }
+        }
+        return new String[] { username, status };
+    }
 }
+
